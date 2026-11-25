@@ -1,0 +1,185 @@
+package com.example
+
+import android.content.Context
+import androidx.room.Room
+import androidx.test.core.app.ApplicationProvider
+import com.example.audio.AudioFileReader
+import com.example.data.local.AppDatabase
+import com.example.data.repository.AudioTranscriptionRepository
+import com.example.data.repository.PairingReviewRepository
+import com.example.data.repository.SavedPairingRepository
+import com.example.model.PairingStrategy
+import com.example.model.buildPairingId
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
+import org.junit.After
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [36])
+class ExampleRobolectricTest {
+
+    private lateinit var db: AppDatabase
+    private lateinit var repository: PairingReviewRepository
+    private lateinit var savedPairingRepository: SavedPairingRepository
+
+    @Before
+    fun setUp() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        repository = PairingReviewRepository(db.pairingReviewDao())
+        savedPairingRepository = SavedPairingRepository(db.savedPairingDao())
+    }
+
+    @After
+    fun tearDown() {
+        db.close()
+    }
+
+    @Test
+    fun `app_name matches Cedar and Oak`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val appName = context.getString(R.string.app_name)
+        assertEquals("Cedar & Oak", appName)
+    }
+
+    @Test
+    fun `submit reviews computes accurate average rating and supports update and delete`() = runBlocking {
+        val cigarId = "padron_1964"
+        val bevId = "cuban_cafecito"
+        val pid = buildPairingId(cigarId, bevId)
+
+        val firstId = repository.submitReview(
+            cigarId = cigarId,
+            beverageId = bevId,
+            rating = 5,
+            reviewText = "Velvety cocoa and sweet demerara crema.",
+            reviewerName = "Tester A",
+        )
+        repository.submitReview(
+            cigarId = cigarId,
+            beverageId = bevId,
+            rating = 3,
+            reviewText = "Good, slightly bold.",
+            reviewerName = "Tester B",
+        )
+
+        val summaries = repository.observeRatingSummaries().first()
+        val summary = summaries[pid]
+        assertNotNull(summary)
+        assertEquals(4.0, summary!!.averageRating, 0.01)
+        assertEquals(2, summary.reviewCount)
+
+        // Update first review from 5 to 4
+        repository.submitReview(
+            cigarId = cigarId,
+            beverageId = bevId,
+            rating = 4,
+            reviewText = "Balanced finish.",
+            reviewerName = "Tester A",
+            existingReviewId = firstId,
+        )
+        val updatedSummary = repository.observeRatingSummaries().first()[pid]
+        assertEquals(3.5, updatedSummary!!.averageRating, 0.01)
+        assertEquals(2, updatedSummary.reviewCount)
+
+        // Delete first review -> only rating 3 remains
+        repository.deleteReview(firstId)
+        val afterDeleteSummary = repository.observeRatingSummaries().first()[pid]
+        assertEquals(3.0, afterDeleteSummary!!.averageRating, 0.01)
+        assertEquals(1, afterDeleteSummary.reviewCount)
+
+        val otherSummary = repository.observeRatingSummaries().first()["nonexistent__pair"]
+        assertNull(otherSummary)
+    }
+
+    @Test
+    fun `save and delete audio transcriptions in Room`() = runBlocking {
+        val txRepo = AudioTranscriptionRepository(db.audioTranscriptionDao())
+        val savedId = txRepo.saveTranscription(
+            title = "Padron 3000 Tasting Note",
+            sourceLabel = "Voice Memo (00:18)",
+            durationSeconds = 18,
+            styleLabel = "Tasting Memo",
+            transcriptText = "Warm walnut, cedar spice, and espresso pairing cleanly with bourbon.",
+        )
+
+        val list = txRepo.observeTranscriptions().first()
+        assertEquals(1, list.size)
+        assertEquals("Padron 3000 Tasting Note", list.first().title)
+        assertEquals(18, list.first().durationSeconds)
+
+        txRepo.deleteTranscription(savedId)
+        val afterDelete = txRepo.observeTranscriptions().first()
+        assertEquals(0, afterDelete.size)
+    }
+
+    @Test
+    fun `pairing room db seeds flagship pairings and supports full CRUD lifecycle`() = runBlocking {
+        savedPairingRepository.ensureSeeded()
+        val seeded = savedPairingRepository.observeAllSavedPairings().first()
+        assertTrue("Expected at least 6 seeded pairings, got ${seeded.size}", seeded.size >= 6)
+        assertTrue("Expected seeded favorites", seeded.any { it.isFavorite })
+
+        val cigarId = "davidoff_sig2"
+        val bevId = "roasted_oolong"
+        val pid = buildPairingId(cigarId, bevId)
+
+        // Save custom pairing
+        savedPairingRepository.saveOrUpdatePairing(
+            cigarId = cigarId,
+            beverageId = bevId,
+            personalNotes = "Crisp floral afternoon pairing.",
+            occasionTag = "Morning Coffee",
+            isFavorite = false,
+            strategy = PairingStrategy.BALANCED,
+        )
+        val saved = savedPairingRepository.observeSavedPairing(pid).first()
+        assertNotNull(saved)
+        assertEquals("Crisp floral afternoon pairing.", saved!!.personalNotes)
+        assertEquals("Morning Coffee", saved.occasionTag)
+        assertFalse(saved.isFavorite)
+        assertEquals(1, saved.timesEnjoyed)
+
+        // Toggle favorite and log session
+        savedPairingRepository.toggleFavorite(pid)
+        savedPairingRepository.logSessionEnjoyed(pid)
+        savedPairingRepository.updateNotesAndOccasion(
+            pairingId = pid,
+            notes = "Silky cedar and toasted oolong harmony.",
+            occasionTag = "Weekend Ritual",
+        )
+
+        val updated = savedPairingRepository.observeSavedPairing(pid).first()
+        assertNotNull(updated)
+        assertTrue(updated!!.isFavorite)
+        assertEquals(2, updated.timesEnjoyed)
+        assertEquals("Silky cedar and toasted oolong harmony.", updated.personalNotes)
+        assertEquals("Weekend Ritual", updated.occasionTag)
+
+        // Toggle off deletes it
+        val nowSaved = savedPairingRepository.toggleSavePairing(cigarId, bevId)
+        assertFalse(nowSaved)
+        assertNull(savedPairingRepository.observeSavedPairing(pid).first())
+    }
+
+    @Test
+    fun `normalizeAudioMime infers common audio container formats`() {
+        assertEquals("audio/mpeg", AudioFileReader.normalizeAudioMime("", "tasting_session.mp3"))
+        assertEquals("audio/wav", AudioFileReader.normalizeAudioMime("application/octet-stream", "clip.wav"))
+        assertEquals("audio/ogg", AudioFileReader.normalizeAudioMime("", "voice.ogg"))
+        assertEquals("audio/mp4", AudioFileReader.normalizeAudioMime("", "memo.m4a"))
+        assertEquals("audio/flac", AudioFileReader.normalizeAudioMime("audio/flac", "master.flac"))
+    }
+}
